@@ -1,7 +1,7 @@
 //! Provides functions to parse input IP addresses, CIDRs or files.
 use std::collections::BTreeSet;
 use std::fs::{self, File};
-use std::io::{prelude::*, BufReader};
+use std::io::{self, prelude::*, BufReader};
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::Path;
 use std::str::FromStr;
@@ -15,6 +15,12 @@ use log::debug;
 
 use crate::input::Opts;
 use crate::warning;
+
+/// Value of `--addresses` that reads targets from stdin.
+///
+/// Using `-a -` (e.g. `cat targets.txt | rustscan -a -`) avoids hitting the
+/// POSIX `argv` size limit when scanning a very large number of targets.
+pub const STDIN_MARKER: &str = "-";
 
 /// Parses the string(s) into IP addresses.
 ///
@@ -34,8 +40,9 @@ pub fn parse_addresses(input: &Opts) -> Vec<IpAddr> {
     let mut ips: Vec<IpAddr> = Vec::new();
     let mut unresolved_addresses: Vec<&str> = Vec::new();
     let backup_resolver = get_resolver(&input.resolver);
+    let expanded_addresses = expand_stdin_markers(&input.addresses);
 
-    for address in &input.addresses {
+    for address in &expanded_addresses {
         let parsed_ips = parse_address(address, &backup_resolver);
         if !parsed_ips.is_empty() {
             ips.extend(parsed_ips);
@@ -76,6 +83,68 @@ pub fn parse_addresses(input: &Opts) -> Vec<IpAddr> {
     ips.retain(|ip| seen.insert(*ip) && !excluded_cidrs.iter().any(|cidr| cidr.contains(ip)));
 
     ips
+}
+
+/// Expands every [`STDIN_MARKER`] (`-`) entry in `addresses` with targets read
+/// from stdin.
+///
+/// Stdin is read at most once, even if `-` is passed multiple times, and each
+/// stdin line may hold comma- and/or whitespace-separated targets so
+/// `cat targets.txt | rustscan -a -` works for very large target lists that
+/// would otherwise exceed the POSIX `argv` limit.
+fn expand_stdin_markers(addresses: &[String]) -> Vec<String> {
+    if !addresses.iter().any(|address| address == STDIN_MARKER) {
+        return addresses.to_vec();
+    }
+
+    let stdin_targets = read_targets_from_stdin();
+    let mut expanded: Vec<String> = Vec::new();
+    let mut stdin_consumed = false;
+
+    for address in addresses {
+        if address == STDIN_MARKER {
+            if !stdin_consumed {
+                expanded.extend(stdin_targets.clone());
+                stdin_consumed = true;
+            }
+        } else {
+            expanded.push(address.clone());
+        }
+    }
+
+    expanded
+}
+
+/// Reads newline-delimited targets from stdin.
+fn read_targets_from_stdin() -> Vec<String> {
+    parse_targets_from_reader(io::stdin().lock())
+}
+
+/// Splits stdin/file-like lines into individual targets.
+///
+/// Each line may contain comma- and/or whitespace-separated CIDRs, IPs, or
+/// hosts. Empty entries and bare [`STDIN_MARKER`] entries are ignored to avoid
+/// recursive stdin reads.
+fn parse_targets_from_reader<R: BufRead>(reader: R) -> Vec<String> {
+    let mut targets = Vec::new();
+
+    for line in reader.lines() {
+        let Ok(line) = line else {
+            debug!("Line in stdin is not valid UTF-8");
+            continue;
+        };
+        for comma_part in line.split(',') {
+            for token in comma_part.split_whitespace() {
+                let token = token.trim();
+                if token.is_empty() || token == STDIN_MARKER {
+                    continue;
+                }
+                targets.push(token.to_owned());
+            }
+        }
+    }
+
+    targets
 }
 
 /// Given a string, parse it as a host, IP address, or CIDR.
@@ -236,7 +305,7 @@ fn read_ips_from_file(
 
 #[cfg(test)]
 mod tests {
-    use super::{get_resolver, parse_addresses, Opts};
+    use super::{get_resolver, parse_addresses, parse_targets_from_reader, Opts};
     use std::net::Ipv4Addr;
 
     #[test]
@@ -430,5 +499,38 @@ mod tests {
         let lookup = resolver.lookup_ip("www.example.com.").unwrap();
 
         assert!(lookup.iter().next().is_some());
+    }
+
+    #[test]
+    fn parse_stdin_newline_delimited_targets() {
+        let input = "127.0.0.1\n192.168.0.1\n10.0.0.0/30\n";
+        let targets = parse_targets_from_reader(input.as_bytes());
+
+        assert_eq!(targets, vec!["127.0.0.1", "192.168.0.1", "10.0.0.0/30"]);
+    }
+
+    #[test]
+    fn parse_stdin_comma_and_whitespace_separated_targets() {
+        let input = "127.0.0.1,192.168.0.1 10.0.0.1\n\n 192.168.1.0/30 , example.com \n";
+        let targets = parse_targets_from_reader(input.as_bytes());
+
+        assert_eq!(
+            targets,
+            vec![
+                "127.0.0.1",
+                "192.168.0.1",
+                "10.0.0.1",
+                "192.168.1.0/30",
+                "example.com"
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_stdin_ignores_empty_and_stdin_marker_tokens() {
+        let input = "\n-\n127.0.0.1\n-\n";
+        let targets = parse_targets_from_reader(input.as_bytes());
+
+        assert_eq!(targets, vec!["127.0.0.1"]);
     }
 }
