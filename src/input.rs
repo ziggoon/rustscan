@@ -73,6 +73,8 @@ fn parse_range(input: &str) -> Result<PortRange, String> {
 /// - GitHub <https://github.com/RustScan/RustScan>
 pub struct Opts {
     /// A comma-delimited list or newline-delimited file of separated CIDRs, IPs, or hosts to be scanned.
+    /// Use '-' to read targets from stdin, e.g. 'cat targets.txt | rustscan -a -',
+    /// to avoid hitting the POSIX argv limit with large target lists.
     #[arg(short, long, value_delimiter = ',')]
     pub addresses: Vec<String>,
 
